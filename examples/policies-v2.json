@@ -1,0 +1,42 @@
+{
+  "version": "v2",
+  "name": "cluster-default",
+  "defaultEffect": "deny",
+  "rules": [
+    {
+      "id": "deny-privileged",
+      "description": "Privileged pods are never admitted.",
+      "priority": 100,
+      "effect": "deny",
+      "message": "privileged containers are forbidden",
+      "match": {
+        "all": [
+          {"field": "kind", "operator": "eq", "value": "Pod"},
+          {"field": "spec.privileged", "operator": "eq", "value": true}
+        ]
+      }
+    },
+    {
+      "id": "warn-large-replicas",
+      "priority": 20,
+      "effect": "warn",
+      "message": "deployments with more than 10 replicas need capacity review",
+      "match": {
+        "all": [
+          {"field": "kind", "operator": "eq", "value": "Deployment"},
+          {"field": "spec.replicas", "operator": "gt", "value": 10}
+        ]
+      }
+    },
+    {
+      "id": "allow-known-workloads",
+      "priority": 10,
+      "effect": "allow",
+      "match": {
+        "all": [
+          {"field": "kind", "operator": "in", "values": ["Pod", "Deployment", "Service", "ConfigMap"]}
+        ]
+      }
+    }
+  ]
+}

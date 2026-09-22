@@ -1,0 +1,27 @@
+{
+  "version": "v1",
+  "name": "cluster-default-2023",
+  "rules": [
+    {
+      "name": "block-prod-big",
+      "action": "reject",
+      "severity": "critical",
+      "targetKind": "Deployment",
+      "selector": {"env": "prod"},
+      "constraint": {"field": "spec.replicas", "op": ">", "value": 10},
+      "extra": {"message": "production deployments are capped at 10 replicas"}
+    },
+    {
+      "name": "warn-temp-names",
+      "action": "warn",
+      "severity": "medium",
+      "targetKind": "Pod",
+      "constraint": {"field": "name", "op": "like", "value": "tmp-*"}
+    },
+    {
+      "name": "allow-services",
+      "action": "permit",
+      "targetKind": "Service"
+    }
+  ]
+}

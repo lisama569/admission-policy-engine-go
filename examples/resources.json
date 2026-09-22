@@ -1,0 +1,9 @@
+{
+  "resources": [
+    {"apiVersion":"v1","kind":"Pod","namespace":"prod","name":"db","labels":{"env":"prod"},"extra":{"spec.privileged":true}},
+    {"apiVersion":"apps/v1","kind":"Deployment","namespace":"prod","name":"web","labels":{"env":"prod"},"extra":{"spec.replicas":12}},
+    {"apiVersion":"v1","kind":"Pod","namespace":"dev","name":"tmp-worker","labels":{"env":"dev"}},
+    {"apiVersion":"v1","kind":"Service","namespace":"dev","name":"api"},
+    {"apiVersion":"v1","kind":"ConfigMap","namespace":"dev","name":"cfg"}
+  ]
+}
