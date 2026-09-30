@@ -154,13 +154,18 @@ func higherPriority(a, b RuleHit) bool {
 // 无任何规则命中时结论为 allow（默认放行），并在 Reason 中明确说明。
 func (e *Engine) Evaluate(r Resource) Result {
 	snap := e.current.Load()
-	ps := snap.policySet
+	return evaluateWithSet(r, snap.policySet)
+}
 
+// evaluateWithSet 是所有评估路径（单资源、批量、候选预演）共用的确定性
+// 评估核心：给定一份不可变策略集与资源，产出完整可解释结论。
+// 预演候选侧与候选生效后调用的都是这同一份实现，因此两边结论必然一致。
+func evaluateWithSet(r Resource, ps PolicySet) Result {
 	hits := make([]RuleHit, 0)
 	for _, rule := range ps.Rules {
 		h, ok, err := matchRule(r, rule)
 		if err != nil {
-			// 引擎内的策略集均经过校验，匹配期不应出现非法操作符/取值；
+			// 进入引擎/预演的策略集均经过校验，匹配期不应出现非法操作符/取值；
 			// 若真的发生，按失败闭合（fail-closed）处理为 deny，绝不静默放行。
 			return Result{
 				Decision:      DecisionDeny,
