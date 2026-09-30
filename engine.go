@@ -154,8 +154,13 @@ func higherPriority(a, b RuleHit) bool {
 // 无任何规则命中时结论为 allow（默认放行），并在 Reason 中明确说明。
 func (e *Engine) Evaluate(r Resource) Result {
 	snap := e.current.Load()
-	ps := snap.policySet
+	return evaluatePolicySet(snap.policySet, r)
+}
 
+// evaluatePolicySet 是与引擎状态无关的纯评估函数：结论只由 (策略集, 资源) 决定。
+// 线上评估与候选策略预演共用这一条路径，因此预演结论与候选真正生效后的结论
+// 在构造上必然一致。传入的策略集必须已经通过 ValidatePolicySet。
+func evaluatePolicySet(ps PolicySet, r Resource) Result {
 	hits := make([]RuleHit, 0)
 	for _, rule := range ps.Rules {
 		h, ok, err := matchRule(r, rule)

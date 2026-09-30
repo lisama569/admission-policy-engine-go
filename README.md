@@ -1,7 +1,8 @@
 # 本地准入策略评估引擎
 
 在资源提交前，依据策略集给出**允许（allow）/ 拒绝（deny）/ 告警（warn）**
-的可解释、可复现结论；支持原子热更新、并发评估与历史 v1 格式兼容转换。
+的可解释、可复现结论；支持原子热更新、并发评估、历史 v1 格式兼容转换，以及
+**候选策略批量预演与安全切换**。
 
 ## 快速开始
 
@@ -18,6 +19,15 @@ e, err := policy.NewEngine(policy.PolicySet{
 })
 res := e.Evaluate(resource) // res.Decision / res.Hits / res.WinningRule / res.Reason
 _ = e.Update(newPolicySet)  // 先校验后原子切换；失败保留旧版本
+
+// 候选策略预演 -> 确认差异 -> 原子生效（整份生效或完全不生效）
+cand, _ := policy.PrepareCandidate(candidatePolicySet)         // 现行格式
+cand, _ = policy.PrepareCandidateLegacy(rawLegacyV1JSON)        // 或历史 v1 JSON
+report, _ := e.Rehearse(batchResources, cand)                   // 逐条差异 + 汇总计数
+fmt.Print(report.Text())
+_ = e.Promote(cand)
+
+br := e.EvaluateBatch(batchResources) // 只需批量评估时：整批固定同一版本
 ```
 
 历史配置：`ps, err := policy.ConvertLegacyV1(rawV1JSON)`，成功后再 `NewEngine`/`Update`。
@@ -27,6 +37,7 @@ _ = e.Update(newPolicySet)  // 先校验后原子切换；失败保留旧版本
 - [策略匹配与优先级规则](docs/policy-matching.md)
 - [热更新与并发可见性保证](docs/hot-update.md)
 - [历史策略格式（v1）兼容转换](docs/legacy-format.md)
+- [候选策略预演与安全切换](docs/candidate-rehearsal.md)
 
 ## 测试
 
