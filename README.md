@@ -46,4 +46,7 @@ go test ./... -race -count=1 -v   # 并发一致性、热更新竞争、历史�
 ```
 
 测试日志会打印每个评估的输入资源、命中的规则（含每个条件的期望值与资源
-实际值）、决胜规则与文字判定依据。
+实际值）、决胜规则与文字判定依据。未就绪候选（nil、零值 `&policy.Candidate{}`）
+会在评估前被整份拒绝（`candidate_unavailable` / `candidate_not_prepared`），
+预演与切换判定一致、线上策略不变；细节见
+[候选策略预演与安全切换](docs/candidate-rehearsal.md)。

@@ -655,13 +655,20 @@ func TestPromote_AtomicVisibility(t *testing.T) {
 				t.Fatalf("Promote: %v", err)
 			}
 			// 构造一个故意被篡改的候选（正常路径不可达，仅验证防御性复查）：
-			// 这里通过直接操作内部字段模拟"归一后与约束冲突"的极端情况。
+			// 标记为已就绪、但策略版本为空，必须被 Promote 内部的
+			// ValidatePolicySet 复查拒绝（而不是被就绪拦截挡住）。
 			tampered := &Candidate{
-				source: CandidateSource{Kind: CandidateFromCurrent},
-				policy: PolicySet{Version: "", Rules: v2.Rules},
+				source:   CandidateSource{Kind: CandidateFromCurrent},
+				policy:   PolicySet{Version: "", Rules: v2.Rules},
+				prepared: true,
 			}
 			if err := e.Promote(tampered); err == nil {
 				t.Fatal("Promote of invalid candidate must fail")
+			} else {
+				var ve *ValidationError
+				if !errors.As(err, &ve) || ve.Reason != ErrReasonEmptyPolicyVersion {
+					t.Fatalf("want ValidationError/%s, got %v", ErrReasonEmptyPolicyVersion, err)
+				}
 			}
 		} else {
 			cand2, _ := PrepareCandidate(v1)

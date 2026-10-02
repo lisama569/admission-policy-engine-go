@@ -28,6 +28,11 @@ type CandidateSource struct {
 type Candidate struct {
 	source CandidateSource
 	policy PolicySet
+	// prepared 只能由 PrepareCandidate / PrepareCandidateLegacy 在归一与整体
+	// 校验全部通过后置为 true。外部直接构造的零值 Candidate（含 &Candidate{}）
+	// 该字段恒为 false：它不代表"一份空策略"，而是"一份从未走完准备流程、
+	// 不可使用的候选"，必须在任何评估/切换之前被整份拒绝。
+	prepared bool
 }
 
 // ResourceRef 是资源在预演批次中的稳定定位信息：以输入下标为主键，
@@ -89,10 +94,15 @@ type BatchResult struct {
 	Results       []Result `json:"results"`
 }
 
-// 预演相关的可区分失败原因。
+// 预演/切换流程相关的可区分失败原因。
 const (
-	// ErrReasonCandidateUnavailable 表示调用方未提供可用候选（如 nil）。
+	// ErrReasonCandidateUnavailable 表示根本没有提供候选（传了 nil）。
 	ErrReasonCandidateUnavailable = "candidate_unavailable"
+	// ErrReasonCandidateNotPrepared 表示候选指针非 nil，但从未经过
+	// PrepareCandidate / PrepareCandidateLegacy 的归一与整体校验
+	// （例如直接构造的零值 &Candidate{}、准备中途夭折留下的对象）。
+	// 它不是"一份空策略"：绝不允许被当成空策略评估成默认全放行。
+	ErrReasonCandidateNotPrepared = "candidate_not_prepared"
 )
 
 // RehearsalError 表示预演/切换流程本身的使用错误（区别于策略非法的
@@ -117,7 +127,8 @@ func PrepareCandidate(ps PolicySet) (*Candidate, error) {
 			Kind:   CandidateFromCurrent,
 			Detail: "provided in current policy format",
 		},
-		policy: clonePolicySet(ps),
+		policy:   clonePolicySet(ps),
+		prepared: true,
 	}, nil
 }
 
@@ -134,7 +145,8 @@ func PrepareCandidateLegacy(raw []byte) (*Candidate, error) {
 			Kind:   CandidateFromLegacyV1,
 			Detail: "normalized from legacy v1 JSON via ConvertLegacyV1",
 		},
-		policy: clonePolicySet(ps),
+		policy:   clonePolicySet(ps),
+		prepared: true,
 	}, nil
 }
 
@@ -146,6 +158,13 @@ func (c *Candidate) Policy() PolicySet {
 // Source 返回候选的来源格式信息。
 func (c *Candidate) Source() CandidateSource {
 	return c.source
+}
+
+// Ready 报告候选是否已经走完准备流程（PrepareCandidate 或
+// PrepareCandidateLegacy）且通过整体校验。未就绪的候选不是"空策略"，
+// Rehearse 与 Promote 都会以 candidate_not_prepared 整份拒绝它。
+func (c *Candidate) Ready() bool {
+	return c != nil && c.prepared
 }
 
 // pinSnapshot 在操作开始瞬间固定一个完整的策略版本。后续即使线上发生热更新，
@@ -212,11 +231,24 @@ func (e *Engine) Promote(c *Candidate) error {
 	return nil
 }
 
+// requireCandidate 是 Rehearse 与 Promote 共用的、也是唯一的候选可用性
+// 判定入口：两者对同一个候选对象"能不能用"的回答在构造上必然一致，不会
+// 出现预演放行、切换被拒（或反过来）的分歧。
+//
+// 未就绪候选绝不能进入 evaluatePolicySet：否则零规则命中会按默认放行，
+// 凭空得到一份"全放行、空版本号"的误导性报告。
 func requireCandidate(c *Candidate) error {
 	if c == nil {
 		return &RehearsalError{
 			Reason: ErrReasonCandidateUnavailable,
-			Detail: "candidate is nil; prepare it with PrepareCandidate or PrepareCandidateLegacy",
+			Detail: "no candidate provided (nil); prepare it with PrepareCandidate or PrepareCandidateLegacy",
+		}
+	}
+	if !c.prepared {
+		return &RehearsalError{
+			Reason: ErrReasonCandidateNotPrepared,
+			Detail: "candidate was never prepared or failed preparation; " +
+				"build it with PrepareCandidate or PrepareCandidateLegacy instead of constructing Candidate directly",
 		}
 	}
 	return nil
