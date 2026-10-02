@@ -37,6 +37,11 @@ br := engine.EvaluateBatch(resources) // 整批固定在同一个策略版本上
 `Candidate` 一旦构造成功即为**不可变**：内部持有归一策略集的深拷贝，外部
 无法通过原切片或 `Candidate.Policy()`（同样返回深拷贝）改写它。
 
+> **候选只能由上述两个 `Prepare*` 函数构造。** 直接传 `nil`、零值
+> `&policy.Candidate{}`，或绕过准备流程手工拼出的候选对象，都属于
+> “不可用候选”，会在预演/切换开始前被整份拒绝（见
+> [第 4 节](#4-候选可用性闸门与可区分拒绝原因)）。
+
 ## 2. 报告与差异清单怎么读
 
 `RehearsalReport` 字段：
@@ -83,11 +88,45 @@ br := engine.EvaluateBatch(resources) // 整批固定在同一个策略版本上
   相同输入重复预演，差异清单、计数与顺序完全一致。
 - **规模**：按批大小一次性预分配结果切片、逐条就地评估，没有额外的待聚合
   中间结构，几百到几千条资源不丢、不重、内存占用与批次规模成线性关系。
-- **原子切换**：`Promote` 是一次原子指针替换，并发评估只能看到完整的旧版本
-  或完整的新版本；切换前对候选再做一次防御性整体校验，失败则原版本原封不动，
-  不存在半生效状态。
+- **预演/切换同一道闸门（可用性判断一致）**：`Rehearse` 与 `Promote` 共用
+  `requireCandidate` 判定候选能不能用（nil / 未就绪 / 防御性校验失败）。
+  同一份候选在预演和切换上的结论必然一致，不会一个放行评估、一个拒绝切换；
+  被拒调用在触碰引擎状态之前返回。
+- **原子切换**：`Promote` 在闸门通过后执行一次原子指针替换，并发评估只能
+  看到完整的旧版本或完整的新版本；闸门失败则原版本原封不动，不存在半生效
+  状态。
 
-## 4. 候选（含历史格式）的兼容与拒绝范围
+## 4. 候选可用性闸门与可区分拒绝原因
+
+`Rehearse` 与 `Promote` 在**固定快照、产出任何逐条结果或触碰引擎状态之前**，
+共用同一道、也是唯一的候选可用性闸门 `requireCandidate`。因此同一份候选在
+“预演”与“切换”上**能不能用的判断构造上必然一致**：不可能出现预演说能用、
+切换又被拒（或反过来）。
+
+闸门按以下顺序判定，全部返回 `*RehearsalError`，靠 `Reason` 与策略非法的
+`*ValidationError`、历史格式无法归一的 `*ConversionError` 区分：
+
+| 情形 | `RehearsalError.Reason` | 含义 |
+| --- | --- | --- |
+| 调用方传了 `nil` | `candidate_unavailable` | 根本没有提供候选 |
+| 零值 `&Candidate{}`、绕过 `Prepare*` 手拼的对象（哪怕内部塞了“规则”） | `candidate_not_prepared` | 候选没走准备流程，不携带已校验、可评估的策略 |
+| 带准备标记但内嵌策略防御性校验失败（正常公共路径不可达） | `candidate_invalid` | 候选内部异常（细节中会带出底层 `ValidationError`） |
+
+关键安全语义：
+
+- **未就绪不等于“空策略”。** 一份没有规则的合法策略集会让所有资源命中默认
+  放行（allow）。如果把“空的、没准备的候选”误当成这种空策略去评估，就会
+  凭空得到一份“全放行、候选版本为空、到处是结论变化”的误导性报告。闸门在
+  评估之前就整体拒绝，**不产出任何逐条结果，也不汇总任何差异**（返回的
+  `RehearsalReport` 为零值：`Items` 为空、版本为空、`Summary` 为零）。
+- **不改动当前生效策略、不留中间状态。** 闸门只读：被拒调用不会 pin 快照、
+  不会替换生效指针，线上策略与后续评估完全不受影响；即使被拒调用与热更新
+  并发穿插，成功的预演/批量依旧整批固定在同一个完整版本上。
+- **策略本身非法**（版本为空、重复 ID、非法 effect/glob 等）在更早的
+  `Prepare*` 阶段就以 `*ValidationError` / `*ConversionError` 被整体拒绝，
+  根本不会产生候选；详见下文兼容与拒绝范围。
+
+## 5. 候选（含历史格式）的兼容与拒绝范围
 
 - 现行格式候选走 `ValidatePolicySet`：空版本、空/重复规则 ID、非法 effect、
   非法操作符、缺字段/缺取值、非法 glob、空条件等一律**整份拒绝**，错误带可
@@ -99,17 +138,59 @@ br := engine.EvaluateBatch(resources) // 整批固定在同一个策略版本上
   整份候选被拒绝并返回 `*ConversionError`；归一后还需通过现行全部校验
   （如规则 ID 重复则 `*ValidationError`）。**不会静默跳过单条规则，也不会放宽
   成默认放行。**
-- 预演/切换 API 收到 `nil` 候选时返回 `*RehearsalError`（reason
-  `candidate_unavailable`），同样不触碰线上策略。
+- 预演/切换 API 收到 `nil`、零值/手拼的未就绪候选时，在评估前统一返回
+  `*RehearsalError`（reason 分别为 `candidate_unavailable` /
+  `candidate_not_prepared`），不产出逐条结果，也不触碰线上策略
+  （见[第 4 节](#4-候选可用性闸门与可区分拒绝原因)）。
 
-## 5. 从预演到正式生效的本地验证方法
+## 6. 从预演到正式生效的本地验证方法
 
 ```sh
 # 全量测试（含 -race）：预演/批量/切换一致性 + 既有能力无回归
 go test ./... -race -count=1 -v
 ```
 
-重点用例（均在 `rehearse_test.go`）：
+只看“未就绪候选拦截 / 预演切换一致 / 热更新下批量一致”这组新用例：
+
+```sh
+go test -run 'TestRehearse_UnreadyCandidateRejectedWholesale|TestRehearsePromote_ReadinessJudgmentConsistent|TestRehearse_RejectedCallsLeaveNoStateUnderHotUpdate' -v -count=1 .
+```
+
+日志会逐条打印覆盖的业务（`[业务:...]`）、输入资源 JSON、两侧命中规则、
+最终判定与差异原因；可以直接看到未就绪候选被什么 `Reason` 拒绝、线上策略为何
+保持不变。
+
+本地手工复现“踩坑 → 修复后行为”的最小片段：
+
+```go
+e, _ := policy.NewEngine(livePolicy) // live: Pod 一律 deny
+res := []policy.Resource{{"kind": "Pod", "metadata": map[string]any{"name": "p"}}}
+
+bad := &policy.Candidate{} // 空的、没走 Prepare 的候选
+
+// 修复前：不报错，候选侧把资源判成 allow（默认放行）、候选版本为空、凭空出现差异；
+//         而 Promote(bad) 又因 empty_policy_version 被拒——预演与切换矛盾。
+// 修复后：Rehearse 直接返回 *RehearsalError，Reason=candidate_not_prepared，
+//         报告为零值（无任何逐条结果）；Promote(bad) 以同一 Reason 被拒；
+//         e.Current() 仍是 live，后续 Evaluate 结论不变。
+_, err := e.Rehearse(res, bad)   // rehearsal failed (candidate_not_prepared): ...
+err = e.Promote(bad)             // 同样 candidate_not_prepared，线上策略不动
+```
+
+重点用例：
+
+候选可用性（`candidate_readiness_test.go`，新增）：
+
+- `TestRehearse_UnreadyCandidateRejectedWholesale`：`nil`、零值、手拼（带
+  “规则”）三类未就绪候选均在评估前被整份拒绝（可区分 reason、零报告），线上
+  策略与后续评估不变，且不会被当成全放行空策略；
+- `TestRehearsePromote_ReadinessJudgmentConsistent`：同一份候选在
+  `Rehearse` 与 `Promote` 上可用性判断一致（该拒两边同因、该过两边都过），
+  合法候选切换后结论与预演候选列逐条一致；
+- `TestRehearse_RejectedCallsLeaveNoStateUnderHotUpdate`：并发热更新中大量
+  穿插被拒预演，全部零报告零残留，随后的合法预演整批固定在同一个完整版本。
+
+预演/批量/历史（`rehearse_test.go` 等，既有，无回归）：
 
 - `TestRehearse_MatchesPostPromoteEvaluation`：候选侧逐条结论与 `Promote`
   生效后实际评估一致；
@@ -123,7 +204,10 @@ go test ./... -race -count=1 -v
   格式拒绝（含归一后 ID 冲突）、nil 候选等场景线上策略与结论均不变；
 - `TestRehearse_LegacyCandidate`：历史 v1 候选归一、预演、生效全链路一致；
 - `TestPromote_AtomicVisibility`：切换竞争下只观测到完整旧/新版本，失败切换
-  无任何效果。
+  无任何效果；
+- 另有 `engine_test.go`（单资源评估与冲突决胜）、`concurrent_test.go`
+  （并发评估与合法热更新）、`legacy_test.go`（历史格式成功与拒绝原因）、
+  `validation_test.go`（校验原因与失败热更新不污染旧版本）覆盖既有能力。
 
 建议的人工上线流程：
 

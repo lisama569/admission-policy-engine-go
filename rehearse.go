@@ -25,9 +25,15 @@ type CandidateSource struct {
 // Candidate 是一份已经过解析（历史格式）、归一化与整体校验的候选策略。
 // 一旦构造成功便不可变：内部持有策略集深拷贝，调用方无法从外部改写，
 // 因此同一份 Candidate 的预演结论与 Promote 生效后的结论必然一致。
+//
+// 该类型只能通过 PrepareCandidate / PrepareCandidateLegacy 构造：零值
+// （&Candidate{}）或绕过准备流程手工拼出的对象处于"未就绪"状态，
+// Rehearse 与 Promote 会在做任何评估/切换前用同一道闸门整体拒绝，
+// 绝不会把它当成一份"没有规则的空策略"去评估（那会把资源默认判成放行）。
 type Candidate struct {
-	source CandidateSource
-	policy PolicySet
+	source   CandidateSource
+	policy   PolicySet
+	prepared bool // 仅当由 Prepare* 构造、且整体校验通过时为 true
 }
 
 // ResourceRef 是资源在预演批次中的稳定定位信息：以输入下标为主键，
@@ -89,10 +95,18 @@ type BatchResult struct {
 	Results       []Result `json:"results"`
 }
 
-// 预演相关的可区分失败原因。
+// 预演/切换流程本身的可区分失败原因（与策略非法的 ValidationError、
+// 历史格式无法归一的 ConversionError 区分开）。
 const (
-	// ErrReasonCandidateUnavailable 表示调用方未提供可用候选（如 nil）。
+	// ErrReasonCandidateUnavailable 表示根本没有提供候选（调用方传了 nil）。
 	ErrReasonCandidateUnavailable = "candidate_unavailable"
+	// ErrReasonCandidateNotPrepared 表示候选对象存在，但没有走过
+	// PrepareCandidate/PrepareCandidateLegacy 准备流程（例如零值 &Candidate{}），
+	// 因而不携带任何可用、已校验的策略。
+	ErrReasonCandidateNotPrepared = "candidate_not_prepared"
+	// ErrReasonCandidateInvalid 表示候选虽带准备标记，但其内部策略集无法通过
+	// 整体自洽性校验（正常公共路径不可达，仅用于防御内部篡改/构造）。
+	ErrReasonCandidateInvalid = "candidate_invalid"
 )
 
 // RehearsalError 表示预演/切换流程本身的使用错误（区别于策略非法的
@@ -117,7 +131,8 @@ func PrepareCandidate(ps PolicySet) (*Candidate, error) {
 			Kind:   CandidateFromCurrent,
 			Detail: "provided in current policy format",
 		},
-		policy: clonePolicySet(ps),
+		policy:   clonePolicySet(ps),
+		prepared: true,
 	}, nil
 }
 
@@ -134,7 +149,8 @@ func PrepareCandidateLegacy(raw []byte) (*Candidate, error) {
 			Kind:   CandidateFromLegacyV1,
 			Detail: "normalized from legacy v1 JSON via ConvertLegacyV1",
 		},
-		policy: clonePolicySet(ps),
+		policy:   clonePolicySet(ps),
+		prepared: true,
 	}, nil
 }
 
@@ -168,10 +184,16 @@ func (e *Engine) EvaluateBatch(resources []Resource) BatchResult {
 }
 
 // Rehearse 对一批资源同时按当前生效版本与候选版本评估，输出确定性的对比报告。
-// 整批固定在预演开始瞬间的当前版本上；候选不可用或被拒绝时返回错误，
-// 不产生任何部分结果。候选评估直接复用线上评估的同一函数
-// （evaluatePolicySet），因此报告里的候选结论与候选真正 Promote 生效后
-// 对同一批资源的结论逐条一致。
+// 整批固定在预演开始瞬间的当前版本上。
+//
+// 在固定快照、产出任何逐条结果之前，先用与 Promote 完全相同的
+// requireCandidate 闸门确认候选可用：候选为 nil、未走准备流程（空/手拼
+// 对象）或防御性校验失败时整份拒绝，返回可区分的 *RehearsalError，
+// 报告为空、不产生任何逐条结果，更不会把不可用候选当成空策略评估成全放行。
+// 被拒调用只读，不触碰引擎状态，当前生效策略不变。
+//
+// 候选评估直接复用线上评估的同一函数（evaluatePolicySet），因此报告里的
+// 候选结论与候选真正 Promote 生效后对同一批资源的结论逐条一致。
 func (e *Engine) Rehearse(resources []Resource, c *Candidate) (RehearsalReport, error) {
 	if err := requireCandidate(c); err != nil {
 		return RehearsalReport{}, err
@@ -198,25 +220,54 @@ func (e *Engine) Rehearse(resources []Resource, c *Candidate) (RehearsalReport, 
 
 // Promote 将候选策略原子切换为新生效版本：要么整份生效，要么完全不生效。
 // 并发评估只能看到完整的旧版本或完整的新版本（atomic 指针一次切换）。
-// 候选在 Prepare 阶段已完成归一与校验，这里只做一次防御性复查：若复查
-// 失败则原版本原封不动，不会出现半生效状态。
+//
+// 候选可用性判定与 Rehearse 完全共用 requireCandidate：同一份候选在预演与
+// 切换上"能不能用"的结论必然一致。闸门通过后才克隆并一次性替换快照；
+// 闸门失败（nil/未就绪/防御性校验失败）时在触碰任何引擎状态之前返回，
+// 原版本原封不动，不会出现半生效状态。
 func (e *Engine) Promote(c *Candidate) error {
 	if err := requireCandidate(c); err != nil {
 		return err
 	}
 	next := clonePolicySet(c.policy)
-	if err := ValidatePolicySet(next); err != nil {
-		return err
-	}
 	e.current.Store(&engineSnapshot{policySet: next})
 	return nil
 }
 
+// requireCandidate 是预演与切换共用的、唯一的候选可用性闸门。Rehearse 与
+// Promote 必须调用它，从而对"同一份候选能不能用"给出构造上一致的结论：
+// 不可能出现预演说能用、切换又被拒（或反过来）。
+//
+// 判定顺序：
+//  1. nil：调用方根本没提供候选（candidate_unavailable）；
+//  2. 未就绪：对象存在但没走 Prepare 流程（零值/手拼对象），其内嵌策略
+//     不是一份已校验、可评估的策略（如版本为空）。此时必须整体拒绝，
+//     绝不把它当"没有规则的空策略"评估——空规则集会把资源默认判成放行
+//     （candidate_not_prepared）；
+//  3. 防御性整体校验：正常公共路径下 Prepare 已保证校验通过；若候选内部
+//     被本包内的异常构造破坏，则按 candidate_invalid 拒绝。
+//
+// 该检查只读、不触碰引擎当前版本，因此被拒调用不会产生任何中间状态，
+// 也不会改动当前生效策略。
 func requireCandidate(c *Candidate) error {
 	if c == nil {
 		return &RehearsalError{
 			Reason: ErrReasonCandidateUnavailable,
 			Detail: "candidate is nil; prepare it with PrepareCandidate or PrepareCandidateLegacy",
+		}
+	}
+	if !c.prepared {
+		return &RehearsalError{
+			Reason: ErrReasonCandidateNotPrepared,
+			Detail: "candidate was not prepared via PrepareCandidate/PrepareCandidateLegacy " +
+				"(zero-value or hand-built candidate); it carries no validated policy and must " +
+				"not be evaluated as an empty allow-all policy set",
+		}
+	}
+	if err := ValidatePolicySet(c.policy); err != nil {
+		return &RehearsalError{
+			Reason: ErrReasonCandidateInvalid,
+			Detail: "prepared candidate failed defensive validation: " + err.Error(),
 		}
 	}
 	return nil

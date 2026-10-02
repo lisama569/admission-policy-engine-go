@@ -26,6 +26,9 @@ cand, _ = policy.PrepareCandidateLegacy(rawLegacyV1JSON)        // 或历史 v1 
 report, _ := e.Rehearse(batchResources, cand)                   // 逐条差异 + 汇总计数
 fmt.Print(report.Text())
 _ = e.Promote(cand)
+// 注意：nil / &Candidate{} / 绕过 Prepare 手拼的“未就绪候选”会在评估前被
+// Rehearse 与 Promote 以同一道闸门、同一原因整份拒绝（*RehearsalError），
+// 不会被当成全放行空策略，也不改动当前生效策略。
 
 br := e.EvaluateBatch(batchResources) // 只需批量评估时：整批固定同一版本
 ```
